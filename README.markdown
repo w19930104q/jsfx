@@ -64,6 +64,39 @@ var sfx = jsfx.Live(library);
 <button onclick="sfx.coin()">Coin</button>
 ```
 
+### Reproducible and parallel rendering
+
+Every render owns its random source, envelopes and scratch buffers, so two
+renders never share mutable state. Pass a `seed` in the options to make noise,
+the Karplus-Strong buffers and preset randomization reproducible:
+
+```js
+// options may be { seed: ... } or a bare seed value
+var block = jsfx.FloatBuffer(params, jsfx.DefaultModules, { seed: 42 });
+```
+
+`jsfx.RenderLibrary(library, options)` renders a whole library into
+`Float32Array` buffers without touching any browser audio API, which makes it
+usable in Node and in Web Workers. Each sound is derived from one top-level
+seed; rendering the same library with the same seed always produces the same
+samples, including for renders running in parallel. It supports cooperative
+cancellation through an `AbortSignal` and releases every render context on
+completion or abort:
+
+```js
+var controller = new AbortController();
+jsfx.RenderLibrary(library, {
+	seed: "level-1",
+	chunk: 2048,
+	signal: controller.signal,
+	onprogress: function(name, done, total) { /* ... */ }
+}).then(function(stems) {
+	// stems is { name: Float32Array }
+});
+
+controller.abort(); // rejects with an AbortError and leaves no temp state
+```
+
 ### Few notes...
 
 It's recommended to copy the jsfx.js to your own project instead of

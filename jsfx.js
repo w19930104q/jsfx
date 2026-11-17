@@ -17,7 +17,51 @@
 	var EPSILON = 0.000001;
 
 	var jsfx = {};
-	var AudioContext = window.AudioContext || window.webkitAudioContext;
+	var AudioContext = (typeof window !== "undefined") &&
+		(window.AudioContext || window.webkitAudioContext);
+
+	// Deterministic pseudo-random source. Every render context gets its own
+	// instance, so parallel renders never share mutable random state.
+	// mulberry32: 32-bit integer math, identical output on every JS engine.
+	function createRNG(seed) {
+		var state = hashSeed(seed) >>> 0;
+		return function random() {
+			state = (state + 0x6D2B79F5) >>> 0;
+			var t = state;
+			t = Math.imul(t ^ (t >>> 15), t | 1);
+			t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+			return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+		};
+	}
+
+	// Converts numeric or string seeds into a well-mixed 32-bit state.
+	function hashSeed(seed) {
+		if (typeof seed === "number") {
+			return seed >>> 0;
+		}
+		var h = 2166136261 >>> 0;
+		seed = String(seed);
+		for (var i = 0; i < seed.length; i += 1) {
+			h = Math.imul(h ^ seed.charCodeAt(i), 16777619);
+		}
+		return h >>> 0;
+	}
+
+	// Renders may pass either an options object or a bare seed value.
+	// Undefined seed means: keep the historical non-deterministic behavior.
+	function normalizeOptions(options) {
+		if (typeof options === "number" || typeof options === "string") {
+			return { seed: options };
+		}
+		return options || {};
+	}
+
+	// Builds a distinct, order-independent child seed for one sound in a
+	// parallel batch, so every sound has an isolated random stream while the
+	// whole batch stays reproducible from one top-level seed.
+	function childSeed(seed, name, index) {
+		return String(seed) + "::" + name + "#" + index;
+	}
 
 	jsfx.SampleRate = 0 | 0;
 	jsfx.Sec = 0 | 0;
@@ -32,8 +76,9 @@
 
 	// Creates a new Audio object based on the params
 	// params can be a params generating function or the actual parameters
-	jsfx.Sound = function(params) {
-		var processor = new Processor(params, jsfx.DefaultModules);
+	// options: { seed: <number|string> } makes the render deterministic.
+	jsfx.Sound = function(params, modules, options) {
+		var processor = new Processor(params, modules || jsfx.DefaultModules, options);
 		var block = createFloatArray(processor.getSamplesLeft());
 		processor.generate(block);
 		return CreateAudio(block);
@@ -62,6 +107,7 @@
 		var loaded = 0,
 			total = toLoad.length;
 
+		var defer = (typeof window !== "undefined" && window.setTimeout) || setTimeout;
 		function next() {
 			if (toLoad.length == 0) {
 				ondone && ondone(sounds);
@@ -72,7 +118,7 @@
 			loaded++;
 			onprogress && onprogress(name, loaded, total);
 
-			window.setTimeout(next, 30);
+			defer(next, 30);
 		}
 		next();
 
@@ -97,20 +143,123 @@
 		return player;
 	};
 
+	// RenderLibrary generates a named set of Float32Array samples without
+	// touching any browser audio API, so it works in Node and inside workers.
+	//
+	// Each sound gets its own render context (random source, envelopes,
+	// scratch buffers) derived from one top-level seed, therefore rendering
+	// the same library with the same seed always yields identical samples,
+	// including when renders run in parallel. Rendering is split into
+	// cooperative chunks and an AbortSignal can cancel the whole batch.
+	//
+	// options: {
+	//   seed:    <number|string> deterministic seed
+	//   modules: <array>         module list (defaults to jsfx.DefaultModules)
+	//   signal:  <AbortSignal>   cancels the batch
+	//   chunk:   <number>        samples rendered per event-loop turn
+	//   onprogress: function(name, done, total)
+	// }
+	// Returns a Promise resolving to { name: Float32Array }.
+	jsfx.RenderLibrary = function(library, options) {
+		options = normalizeOptions(options);
+		var modules = options.modules || jsfx.DefaultModules;
+		var chunk = (options.chunk || 2048) | 0;
+		var signal = options.signal;
+		var seedDefined = typeof options.seed !== "undefined";
+		var names = Object_keys(library);
+
+		var outputs = {};
+		var index = 0;
+		var done = 0;
+
+		return new Promise(function(resolve, reject) {
+			function failIfAborted() {
+				if (signal && signal.aborted) {
+					reject(new DOMExceptionAbortError());
+					return true;
+				}
+				return false;
+			}
+
+			function renderNext() {
+				if (failIfAborted()) {
+					return;
+				}
+				if (index >= names.length) {
+					resolve(outputs);
+					return;
+				}
+
+				var name = names[index];
+				var renderOptions = {};
+				if (seedDefined) {
+					renderOptions.seed = childSeed(options.seed, name, index);
+				}
+				var processor;
+				try {
+					processor = new Processor(library[name], modules, renderOptions);
+					var length = processor.getSamplesLeft();
+					var block = createFloatArray(length);
+					var offset = 0;
+
+					function pump() {
+						if (failIfAborted()) {
+							// Drop every scratch buffer of the cancelled
+							// context; nothing is kept for a later render.
+							processor.close();
+							return;
+						}
+						var part = block.subarray(offset, Math.min(offset + chunk, length));
+						processor.generate(part);
+						offset += part.length;
+						if (offset < length && !processor.finished) {
+							setTimeout(pump, 0);
+							return;
+						}
+						// The declared length is always fully written and
+						// tail padding is zeroed inside Processor.generate.
+						processor.close();
+						outputs[name] = block;
+						index += 1;
+						done += 1;
+						options.onprogress && options.onprogress(name, done, names.length);
+						setTimeout(renderNext, 0);
+					}
+					pump();
+				} catch (err) {
+					reject(err);
+				}
+			}
+			renderNext();
+		});
+	};
+
+	// AbortError exists as DOMException in browsers; Node 18+ exposes it too,
+	// but fall back to a plain Error where it is missing.
+	function DOMExceptionAbortError() {
+		if (typeof DOMException !== "undefined") {
+			return new DOMException("render aborted", "AbortError");
+		}
+		var err = new Error("render aborted");
+		err.name = "AbortError";
+		return err;
+	}
+
 	// FloatBuffer creates a FloatArray filled with audio
-	jsfx.FloatBuffer = function(params, modules) {
-		var processor = new Processor(params, jsfx.DefaultModules);
+	// options: { seed: <number|string> } makes the render deterministic.
+	jsfx.FloatBuffer = function(params, modules, options) {
+		var processor = new Processor(params, modules || jsfx.DefaultModules, options);
 		var block = createFloatArray(processor.getSamplesLeft());
 		processor.generate(block);
 		return block;
 	};
 
-	if (typeof AudioContext !== "undefined") {
+	if (AudioContext) {
 		// Node creates a new AudioContext ScriptProcessor that outputs the
 		// sound. It will automatically disconnect, unless otherwise specified.
-		jsfx.Node = function(audioContext, params, modules, bufferSize, stayConnected) {
+		jsfx.Node = function(audioContext, params, modules, bufferSize, stayConnected, options) {
 			var node = audioContext.createScriptProcessor(bufferSize, 0, 1);
-			var gen = new Processor(params, modules || jsfx.DefaultModules);
+			var gen = new Processor(params, modules || jsfx.DefaultModules, options);
 			node.onaudioprocess = function(ev) {
 				var block = ev.outputBuffer.getChannelData(0);
 				gen.generate(block);
@@ -127,8 +276,8 @@
 
 		// AudioBuffer creates a buffer filled with the proper audio
 		// This is useful, when you want to use AudioContext.BufferSource
-		jsfx.AudioBuffer = function(audioContext, params, modules) {
-			var processor = new Processor(params, modules || jsfx.DefaultModules);
+		jsfx.AudioBuffer = function(audioContext, params, modules, options) {
+			var processor = new Processor(params, modules || jsfx.DefaultModules, options);
 			var buffer = audioContext.createBuffer(numChannels, processor.getSamplesLeft(), jsfx.SampleRate);
 			var block = buffer.getChannelData(0);
 			processor.generate(block);
@@ -137,9 +286,14 @@
 
 		// Live creates an managed AudioContext for playing.
 		// This is useful, when you want to use procedurally generated sounds.
-		jsfx.Live = function(library, modules, BufferSize) {
+		// options: { seed: <number|string> } makes every triggered note
+		// reproducible; each note uses a distinct child seed.
+		jsfx.Live = function(library, modules, BufferSize, options) {
 			//TODO: add limit for number of notes played at the same time
 			BufferSize = BufferSize || 2048;
+			options = normalizeOptions(options);
+			var seedDefined = typeof options.seed !== "undefined";
+			var noteCount = 0;
 			var player = {};
 
 			var context = new AudioContext();
@@ -149,9 +303,16 @@
 			player._context = context;
 			player._volume = volume;
 
+			function optionsFor(name) {
+				if (!seedDefined) {
+					return options;
+				}
+				return { seed: childSeed(options.seed, name || "_play", noteCount++) };
+			}
+
 			map_object(library, function(params, name) {
 				player[name] = function() {
-					var node = jsfx.Node(context, params, modules, BufferSize);
+					var node = jsfx.Node(context, params, modules, BufferSize, false, optionsFor(name));
 					node.connect(volume);
 				};
 			});
@@ -161,7 +322,7 @@
 			};
 
 			player._play = function(params) {
-				var node = jsfx.Node(context, params, modules, BufferSize);
+				var node = jsfx.Node(context, params, modules, BufferSize, false, optionsFor("_play"));
 				node.connect(volume);
 			};
 
@@ -210,21 +371,32 @@
 
 	// Generates a stateful sound effect processor
 	// params can be a function that creates a parameter set
+	// options: { seed: <number|string> } gives this render its own random
+	// source, so noise and other random modules are reproducible and isolated
+	// from parallel renders.
 	jsfx.Processor = Processor;
 
-	function Processor(params, modules) {
+	function Processor(params, modules, options) {
 		params = params || {};
 		modules = modules || jsfx.DefaultModules;
+		options = normalizeOptions(options);
+
+		// Each render context owns its random source. Without a seed the
+		// historical Math.random behavior is preserved.
+		var random = (typeof options.seed !== "undefined") ?
+			createRNG(options.seed) : Math.random;
 
 		if (typeof params === 'function') {
-			params = params();
+			params = params(random);
 		} else {
 			params = JSON.parse(JSON.stringify(params))
 		}
 		this.finished = false;
+		this.closed = false;
 
 		this.state = {
-			SampleRate: params.SampleRate || jsfx.SampleRate
+			SampleRate: params.SampleRate || jsfx.SampleRate,
+			random: random
 		};
 
 		// sort modules
@@ -240,12 +412,20 @@
 			var M = this.modules[i];
 			this.modules[i].setup(this.state, params[M.name]);
 		}
+
+		// Length declared by the envelope stages before any sample is
+		// rendered. Tail padding must always produce exactly this many
+		// samples for a one-shot render.
+		this.declaredLength = this.getSamplesLeft();
 	}
 	Processor.prototype = {
 		//TODO: see whether this can be converted to a module
 		generate: function(block) {
 			for (var i = 0 | 0; i < block.length; i += 1) {
 				block[i] = 0;
+			}
+			if (this.closed) {
+				throw new Error('cannot generate on a closed render context');
 			}
 			if (this.finished) {
 				return;
@@ -258,22 +438,51 @@
 				var n = M.process($, block.subarray(0, N)) | 0;
 				N = Math.min(N, n);
 			}
-			if (N < block.length) {
+			if (N < block.length || ($.envelopes && $.envelopes.length === 0)) {
+				// A module ended early, or the Volume module consumed its
+				// final envelope stage exactly on this block.
 				this.finished = true;
 			}
+			// Tail padding: every frame beyond the active region is zeroed,
+			// so the output always matches the declared block length even
+			// when a module ends its envelope early.
 			for (var i = N; i < block.length; i++) {
 				block[i] = 0;
 			}
 		},
 		getSamplesLeft: function() {
+			// An exhausted envelope stack means the render is done, not an
+			// uninitialized one. The 3-second fallback only applies before
+			// the Volume module has set up any envelopes.
+			if (!this.state || !this.state.envelopes || this.state.envelopes.length === 0) {
+				return this.finished ? 0 : 3 * (this.state ? this.state.SampleRate : jsfx.SampleRate);
+			}
 			var samples = 0;
 			for (var i = 0; i < this.state.envelopes.length; i += 1) {
 				samples += this.state.envelopes[i].N;
 			}
-			if (samples === 0) {
-				samples = 3 * this.state.SampleRate;
-			}
 			return samples;
+		},
+		// Releases every scratch buffer held by this render context. After
+		// close() the context cannot generate again, so a cancelled render
+		// leaves no reusable temporary state behind.
+		close: function() {
+			if (this.closed) {
+				return;
+			}
+			var $ = this.state;
+			if ($) {
+				delete $.guitarBuffer;
+				delete $.phaserBuffer;
+				if ($.envelopes) {
+					$.envelopes.length = 0;
+				}
+				delete $.random;
+			}
+			this.modules = [];
+			this.state = null;
+			this.closed = true;
+			this.finished = true;
 		}
 	};
 
@@ -346,7 +555,11 @@
 
 				if (repeatTime > repeatLimit) {
 					this.setup($, $.phaseParams);
-					return i + this.process($, block.subarray(i)) - 1;
+					// i frames were already written; the recursive call fills
+					// the remaining block.length - i frames. Returning i + n
+					// (without dropping a frame) keeps the tail aligned with
+					// the declared envelope length.
+					return i + this.process($, block.subarray(i));
 				}
 				repeatTime++;
 
@@ -448,7 +661,7 @@
 				$.generator = P.Func;
 			}
 			if (typeof $.generator === 'object') {
-				$.generator = $.generator.create();
+				$.generator = $.generator.create($);
 			}
 			assert(typeof $.generator === 'function', 'generator must be a function')
 
@@ -482,8 +695,9 @@
 			$.guitarBuffer = createFloatArray(GuitarBufferSize);
 			$.guitarHead = 0;
 			var B = $.guitarBuffer;
+			var random = $.random;
 			for (var i = 0; i < B.length; i++) {
-				B[i] = Math.random() * 2 - 1;
+				B[i] = random() * 2 - 1;
 			}
 		},
 		process: function($, block) {
@@ -764,183 +978,184 @@
 		Reset: function() {
 			return EmptyParams();
 		},
-		Coin: function() {
+		Coin: function(rng) {
 			var p = EmptyParams();
-			p.Frequency.Start = runif(880, 660);
-			p.Volume.Sustain = runif(0.1);
-			p.Volume.Decay = runif(0.4, 0.1);
-			p.Volume.Punch = runif(0.3, 0.3);
-			if (runif() < 0.5) {
-				p.Frequency.ChangeSpeed = runif(0.15, 0.1);
-				p.Frequency.ChangeAmount = runif(8, 4);
+			p.Frequency.Start = runif(880, 660, rng);
+			p.Volume.Sustain = runif(0.1, undefined, rng);
+			p.Volume.Decay = runif(0.4, 0.1, rng);
+			p.Volume.Punch = runif(0.3, 0.3, rng);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Frequency.ChangeSpeed = runif(0.15, 0.1, rng);
+				p.Frequency.ChangeAmount = runif(8, 4, rng);
 			}
 			RemoveEmptyParams(p);
 			return p;
 		},
-		Laser: function() {
+		Laser: function(rng) {
 			var p = EmptyParams();
-			p.Generator.Func = rchoose(['square', 'saw', 'sine']);
+			p.Generator.Func = rchoose(['square', 'saw', 'sine'], rng);
 
-			if (runif() < 0.33) {
-				p.Frequency.Start = runif(880, 440);
-				p.Frequency.Min = runif(0.1);
-				p.Frequency.Slide = runif(0.3, -0.8);
+			if (runif(1, undefined, rng) < 0.33) {
+				p.Frequency.Start = runif(880, 440, rng);
+				p.Frequency.Min = runif(0.1, undefined, rng);
+				p.Frequency.Slide = runif(0.3, -0.8, rng);
 			} else {
-				p.Frequency.Start = runif(1200, 440);
-				p.Frequency.Min = p.Frequency.Start - runif(880, 440);
+				p.Frequency.Start = runif(1200, 440, rng);
+				p.Frequency.Min = p.Frequency.Start - runif(880, 440, rng);
 				if (p.Frequency.Min < 110) {
 					p.Frequency.Min = 110;
 				}
-				p.Frequency.Slide = runif(0.3, -1);
+				p.Frequency.Slide = runif(0.3, -1, rng);
 			}
 
-			if (runif() < 0.5) {
-				p.Generator.A = runif(0.5);
-				p.Generator.ASlide = runif(0.2);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Generator.A = runif(0.5, undefined, rng);
+				p.Generator.ASlide = runif(0.2, undefined, rng);
 			} else {
-				p.Generator.A = runif(0.5, 0.4);
-				p.Generator.ASlide = runif(0.7);
+				p.Generator.A = runif(0.5, 0.4, rng);
+				p.Generator.ASlide = runif(0.7, undefined, rng);
 			}
 
-			p.Volume.Sustain = runif(0.2, 0.1);
-			p.Volume.Decay = runif(0.4);
-			if (runif() < 0.5) {
-				p.Volume.Punch = runif(0.3);
+			p.Volume.Sustain = runif(0.2, 0.1, rng);
+			p.Volume.Decay = runif(0.4, undefined, rng);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Volume.Punch = runif(0.3, undefined, rng);
 			}
-			if (runif() < 0.33) {
-				p.Phaser.Offset = runif(0.2);
-				p.Phaser.Sweep = runif(0.2);
+			if (runif(1, undefined, rng) < 0.33) {
+				p.Phaser.Offset = runif(0.2, undefined, rng);
+				p.Phaser.Sweep = runif(0.2, undefined, rng);
 			}
-			if (runif() < 0.5) {
-				p.Filter.HP = runif(0.3);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Filter.HP = runif(0.3, undefined, rng);
 			}
 			RemoveEmptyParams(p);
 			return p;
 		},
-		Explosion: function() {
+		Explosion: function(rng) {
 			var p = EmptyParams();
 			p.Generator.Func = 'noise';
-			if (runif() < 0.5) {
-				p.Frequency.Start = runif(440, 40);
-				p.Frequency.Slide = runif(0.4, -0.1);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Frequency.Start = runif(440, 40, rng);
+				p.Frequency.Slide = runif(0.4, -0.1, rng);
 			} else {
-				p.Frequency.Start = runif(1600, 220);
-				p.Frequency.Slide = runif(-0.2, -0.2);
+				p.Frequency.Start = runif(1600, 220, rng);
+				p.Frequency.Slide = runif(-0.2, -0.2, rng);
 			}
 
-			if (runif() < 0.2) {
+			if (runif(1, undefined, rng) < 0.2) {
 				p.Frequency.Slide = 0;
 			}
-			if (runif() < 0.3) {
-				p.Frequency.RepeatSpeed = runif(0.5, 0.3);
+			if (runif(1, undefined, rng) < 0.3) {
+				p.Frequency.RepeatSpeed = runif(0.5, 0.3, rng);
 			}
 
-			p.Volume.Sustain = runif(0.3, 0.1);
-			p.Volume.Decay = runif(0.5);
-			p.Volume.Punch = runif(0.6, 0.2);
+			p.Volume.Sustain = runif(0.3, 0.1, rng);
+			p.Volume.Decay = runif(0.5, undefined, rng);
+			p.Volume.Punch = runif(0.6, 0.2, rng);
 
-			if (runif() < 0.5) {
-				p.Phaser.Offset = runif(0.9, -0.3);
-				p.Phaser.Sweep = runif(-0.3);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Phaser.Offset = runif(0.9, -0.3, rng);
+				p.Phaser.Sweep = runif(-0.3, undefined, rng);
 			}
 
-			if (runif() < 0.33) {
-				p.Frequency.ChangeSpeed = runif(0.3, 0.6);
-				p.Frequency.ChangeAmount = runif(24, -12);
+			if (runif(1, undefined, rng) < 0.33) {
+				p.Frequency.ChangeSpeed = runif(0.3, 0.6, rng);
+				p.Frequency.ChangeAmount = runif(24, -12, rng);
 			}
 			RemoveEmptyParams(p);
 			return p;
 		},
-		Powerup: function() {
+		Powerup: function(rng) {
 			var p = EmptyParams();
-			if (runif() < 0.5) {
+			if (runif(1, undefined, rng) < 0.5) {
 				p.Generator.Func = 'saw';
 			} else {
-				p.Generator.A = runif(0.6);
+				p.Generator.A = runif(0.6, undefined, rng);
 			}
 
-			p.Frequency.Start = runif(220, 440);
-			if (runif() < 0.5) {
-				p.Frequency.Slide = runif(0.5, 0.2);
-				p.Frequency.RepeatSpeed = runif(0.4, 0.4);
+			p.Frequency.Start = runif(220, 440, rng);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Frequency.Slide = runif(0.5, 0.2, rng);
+				p.Frequency.RepeatSpeed = runif(0.4, 0.4, rng);
 			} else {
-				p.Frequency.Slide = runif(0.2, 0.05);
-				if (runif() < 0.5) {
-					p.Vibrato.Depth = runif(0.6, 0.1);
-					p.Vibrato.Frequency = runif(30, 10);
+				p.Frequency.Slide = runif(0.2, 0.05, rng);
+				if (runif(1, undefined, rng) < 0.5) {
+					p.Vibrato.Depth = runif(0.6, 0.1, rng);
+					p.Vibrato.Frequency = runif(30, 10, rng);
 				}
 			}
 
-			p.Volume.Sustain = runif(0.4);
-			p.Volume.Decay = runif(0.4, 0.1);
+			p.Volume.Sustain = runif(0.4, undefined, rng);
+			p.Volume.Decay = runif(0.4, 0.1, rng);
 
 			RemoveEmptyParams(p);
 			return p;
 		},
-		Hit: function() {
+		Hit: function(rng) {
 			var p = EmptyParams();
-			p.Generator.Func = rchoose(['square', 'saw', 'noise']);
-			p.Generator.A = runif(0.6);
-			p.Generator.ASlide = runif(1, -0.5);
+			p.Generator.Func = rchoose(['square', 'saw', 'noise'], rng);
+			p.Generator.A = runif(0.6, undefined, rng);
+			p.Generator.ASlide = runif(1, -0.5, rng);
 
-			p.Frequency.Start = runif(880, 220);
-			p.Frequency.Slide = -runif(0.4, 0.3);
+			p.Frequency.Start = runif(880, 220, rng);
+			p.Frequency.Slide = -runif(0.4, 0.3, rng);
 
-			p.Volume.Sustain = runif(0.1);
-			p.Volume.Decay = runif(0.2, 0.1);
+			p.Volume.Sustain = runif(0.1, undefined, rng);
+			p.Volume.Decay = runif(0.2, 0.1, rng);
 
-			if (runif() < 0.5) {
-				p.Filter.HP = runif(0.3);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Filter.HP = runif(0.3, undefined, rng);
 			}
 
 			RemoveEmptyParams(p);
 			return p;
 		},
-		Jump: function() {
+		Jump: function(rng) {
 			var p = EmptyParams();
 			p.Generator.Func = 'square';
-			p.Generator.A = runif(0.6);
+			p.Generator.A = runif(0.6, undefined, rng);
 
-			p.Frequency.Start = runif(330, 330);
-			p.Frequency.Slide = runif(0.4, 0.2);
+			p.Frequency.Start = runif(330, 330, rng);
+			p.Frequency.Slide = runif(0.4, 0.2, rng);
 
-			p.Volume.Sustain = runif(0.3, 0.1);
-			p.Volume.Decay = runif(0.2, 0.1);
+			p.Volume.Sustain = runif(0.3, 0.1, rng);
+			p.Volume.Decay = runif(0.2, 0.1, rng);
 
-			if (runif() < 0.5) {
-				p.Filter.HP = runif(0.3);
+			if (runif(1, undefined, rng) < 0.5) {
+				p.Filter.HP = runif(0.3, undefined, rng);
 			}
-			if (runif() < 0.3) {
-				p.Filter.LP = runif(-0.6, 1);
+			if (runif(1, undefined, rng) < 0.3) {
+				p.Filter.LP = runif(-0.6, 1, rng);
 			}
 
 			RemoveEmptyParams(p);
 			return p;
 		},
-		Select: function() {
+		Select: function(rng) {
 			var p = EmptyParams();
-			p.Generator.Func = rchoose(['square', 'saw']);
-			p.Generator.A = runif(0.6);
+			p.Generator.Func = rchoose(['square', 'saw'], rng);
+			p.Generator.A = runif(0.6, undefined, rng);
 
-			p.Frequency.Start = runif(660, 220);
+			p.Frequency.Start = runif(660, 220, rng);
 
-			p.Volume.Sustain = runif(0.1, 0.1);
-			p.Volume.Decay = runif(0.2);
+			p.Volume.Sustain = runif(0.1, 0.1, rng);
+			p.Volume.Decay = runif(0.2, undefined, rng);
 
 			p.Filter.HP = 0.2;
 			RemoveEmptyParams(p);
 			return p;
 		},
-		Lucky: function() {
+		Lucky: function(rng) {
+			var random = rng || Math.random;
 			var p = EmptyParams();
 			map_object(p, function(out, moduleName) {
 				var defs = jsfx.Module[moduleName].params;
 				map_object(defs, function(def, name) {
 					if (def.C) {
 						var values = Object_keys(def.C);
-						out[name] = values[(values.length * Math.random()) | 0];
+						out[name] = values[(values.length * random()) | 0];
 					} else {
-						out[name] = Math.random() * (def.H - def.L) + def.L;
+						out[name] = random() * (def.H - def.L) + def.L;
 					}
 				});
 			});
@@ -954,7 +1169,7 @@
 	// GENERATORS
 
 	// uniform noise
-	jsfx.G.unoise = newGenerator("sample = Math.random();");
+	jsfx.G.unoise = newGenerator("sample = $.random();");
 	// sine wave
 	jsfx.G.sine = newGenerator("sample = Math.sin(phase);");
 	// saw wave
@@ -966,19 +1181,20 @@
 	// simple synth
 	jsfx.G.synth = newGenerator("sample = Math.sin(phase) + .5*Math.sin(phase/2) + .3*Math.sin(phase/4);");
 
-	// STATEFUL
-	var __noiseLast = 0;
-	jsfx.G.noise = newGenerator("if(phase % TAU < 4){__noiseLast = Math.random() * 2 - 1;} sample = __noiseLast;");
+	// STATEFUL: the held noise sample lives on the render context ($), so
+	// parallel renders each keep their own noise state.
+	jsfx.G.noise = newGenerator("if(phase % TAU < 4){$.noiseLast = $.random() * 2 - 1;} sample = $.noiseLast;");
 
 	// Karplus-Strong string
 	jsfx.G.string = {
-		create: function() {
+		create: function($) {
 			var BS = 1 << 16;
 			var BM = BS - 1;
 
 			var buffer = createFloatArray(BS);
+			var random = $.random;
 			for (var i = 0; i < buffer.length; i++) {
-				buffer[i] = Math.random() * 2 - 1;
+				buffer[i] = random() * 2 - 1;
 			}
 
 			var head = 0;
@@ -1106,6 +1322,9 @@
 	// HELPERS
 	jsfx.Util = {};
 
+	// Creates an independent deterministic random source from a seed.
+	jsfx.Util.createRNG = createRNG;
+
 	// Copies array of Floats to a Uint8Array with 16bits per sample
 	jsfx.Util.CopyFToU8 = CopyFToU8;
 
@@ -1141,7 +1360,7 @@
 
 	// uses AudioContext sampleRate or 44100;
 	function getDefaultSampleRate() {
-		if (typeof AudioContext !== 'undefined') {
+		if (AudioContext) {
 			return (new AudioContext()).sampleRate;
 		}
 		return 44100;
@@ -1189,8 +1408,10 @@
 	}
 
 	// uniform random
-	function runif(scale, offset) {
-		var a = Math.random();
+	// rng is optional; presets keep using Math.random when called directly.
+	function runif(scale, offset, rng) {
+		var random = rng || Math.random;
+		var a = random();
 		if (scale !== undefined)
 			a *= scale;
 		if (offset !== undefined)
@@ -1198,8 +1419,9 @@
 		return a;
 	}
 
-	function rchoose(gens) {
-		return gens[(gens.length * Math.random()) | 0];
+	function rchoose(gens, rng) {
+		var random = rng || Math.random;
+		return gens[(gens.length * random()) | 0];
 	}
 
 	function Object_keys(obj) {
